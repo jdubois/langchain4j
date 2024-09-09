@@ -31,6 +31,7 @@
         <module>langchain4j-chatglm</module>
         <module>langchain4j-cohere</module>
         <module>langchain4j-dashscope</module>
+        <module>langchain4j-github-models</module>
         <module>langchain4j-hugging-face</module>
         <module>langchain4j-jlama</module>
         <module>langchain4j-jina</module>
