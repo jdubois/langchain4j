@@ -1,52 +1,78 @@
 package dev.langchain4j.model.github;
 
-import com.azure.ai.openai.OpenAIClient;
-import com.azure.ai.openai.models.*;
+import com.azure.ai.inference.ChatCompletionsClient;
+import com.azure.ai.inference.models.ChatCompletions;
+import com.azure.ai.inference.models.ChatCompletionsOptions;
+import com.azure.ai.inference.models.ChatCompletionsResponseFormat;
+import com.azure.core.exception.HttpResponseException;
 import com.azure.core.http.ProxyOptions;
-import dev.langchain4j.model.Tokenizer;
-import dev.langchain4j.model.azure.AzureOpenAiChatModel;
-import dev.langchain4j.model.chat.listener.ChatModelListener;
+import dev.langchain4j.agent.tool.ToolSpecification;
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.listener.*;
 import dev.langchain4j.model.github.spi.GitHubModelsChatModelBuilderFactory;
+import dev.langchain4j.model.output.FinishReason;
+import dev.langchain4j.model.output.Response;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
+import static dev.langchain4j.data.message.AiMessage.aiMessage;
+import static dev.langchain4j.internal.Utils.getOrDefault;
+import static dev.langchain4j.internal.Utils.isNullOrEmpty;
+import static dev.langchain4j.model.github.InternalGitHubModelHelper.*;
 import static dev.langchain4j.spi.ServiceHelper.loadFactories;
+import static java.util.Collections.emptyList;
+import static java.util.Collections.singletonList;
 
-/**
- * Represents a GitHub Models language model, that has a chat completion interface, such as OpenAI GPT-4o mini.
- * <p>
- * GitHub Models can be found in the marketplace at "https://github.com/marketplace/models".
- * <p>
- * Mandatory parameters for initialization are:
- * - a GitHub token for authentication and
- * - the model name.
- * <p>
- * As GitHub Models are running on Azure, this uses the LangChain4J Azure OpenAI implementation.
- */
-public class GitHubModelsChatModel extends AzureOpenAiChatModel {
+public class GitHubModelsChatModel implements ChatLanguageModel {
 
     private static final Logger logger = LoggerFactory.getLogger(GitHubModelsChatModel.class);
 
-    public static final String GITHUB_MODELS_INFERENCE_ENDPOINT = "https://models.inference.ai.azure.com";
+    private ChatCompletionsClient client;
+    private final String modelName;
+    private final Integer maxTokens;
+    private final Double temperature;
+    private final Double topP;
+    private final List<String> stop;
+    private final Double presencePenalty;
+    private final Double frequencyPenalty;
+    private final Long seed;
+    private final ChatCompletionsResponseFormat responseFormat;
+    private final List<ChatModelListener> listeners;
 
-    public GitHubModelsChatModel(String apiKey,
-                                String deploymentName,
-                                Tokenizer tokenizer,
+    public GitHubModelsChatModel(ChatCompletionsClient client,
+                                String modelName,
                                 Integer maxTokens,
                                 Double temperature,
                                 Double topP,
-                                Map<String, Integer> logitBias,
-                                String user,
-                                Integer n,
                                 List<String> stop,
                                 Double presencePenalty,
                                 Double frequencyPenalty,
-                                List<AzureChatExtensionConfiguration> dataSources,
-                                AzureChatEnhancementConfiguration enhancements,
+                                Long seed,
+                                ChatCompletionsResponseFormat responseFormat,
+                                List<ChatModelListener> listeners) {
+
+        this(modelName, maxTokens, temperature, topP, stop, presencePenalty, frequencyPenalty, seed, responseFormat, listeners);
+        this.client = client;
+    }
+
+    public GitHubModelsChatModel(String endpoint,
+                                String serviceVersion,
+                                String gitHubToken,
+                                String modelName,
+                                Integer maxTokens,
+                                Double temperature,
+                                Double topP,
+                                List<String> stop,
+                                Double presencePenalty,
+                                Double frequencyPenalty,
                                 Long seed,
                                 ChatCompletionsResponseFormat responseFormat,
                                 Duration timeout,
@@ -54,70 +80,209 @@ public class GitHubModelsChatModel extends AzureOpenAiChatModel {
                                 ProxyOptions proxyOptions,
                                 boolean logRequestsAndResponses,
                                 List<ChatModelListener> listeners,
-                                String userAgentSuffix) {
+                                String userAgentSuffix,
+                                Map<String, String> customHeaders) {
 
-        super(GITHUB_MODELS_INFERENCE_ENDPOINT, "", apiKey, deploymentName, tokenizer, maxTokens, temperature, topP, logitBias, user, n, stop, presencePenalty, frequencyPenalty, dataSources, enhancements, seed, responseFormat, timeout, maxRetries, proxyOptions, logRequestsAndResponses, listeners, userAgentSuffix);
+        this(modelName, maxTokens, temperature, topP, stop, presencePenalty, frequencyPenalty, seed, responseFormat, listeners);
+        this.client = setupSyncClient(endpoint, serviceVersion, gitHubToken, timeout, maxRetries, proxyOptions, logRequestsAndResponses, userAgentSuffix, customHeaders);
     }
 
-    public static GitHubModelsChatModel.Builder builder2() {
+    private GitHubModelsChatModel(String modelName,
+                                 Integer maxTokens,
+                                 Double temperature,
+                                 Double topP,
+                                 List<String> stop,
+                                 Double presencePenalty,
+                                 Double frequencyPenalty,
+                                 Long seed,
+                                 ChatCompletionsResponseFormat responseFormat,
+                                 List<ChatModelListener> listeners) {
+
+        this.modelName = getOrDefault(modelName, "Phi-3.5-mini-instruct");
+        this.maxTokens = maxTokens;
+        this.temperature = getOrDefault(temperature, 0.7);
+        this.topP = topP;
+        this.stop = stop;
+        this.presencePenalty = presencePenalty;
+        this.frequencyPenalty = frequencyPenalty;
+        this.seed = seed;
+        this.responseFormat = responseFormat;
+        this.listeners = listeners == null ? emptyList() : new ArrayList<>(listeners);
+    }
+
+    @Override
+    public Response<AiMessage> generate(List<ChatMessage> messages) {
+        return generate(messages, null, null);
+    }
+
+    @Override
+    public Response<AiMessage> generate(List<ChatMessage> messages, List<ToolSpecification> toolSpecifications) {
+        return generate(messages, toolSpecifications, null);
+    }
+
+    @Override
+    public Response<AiMessage> generate(List<ChatMessage> messages, ToolSpecification toolSpecification) {
+        return generate(messages, singletonList(toolSpecification), toolSpecification);
+    }
+
+    private Response<AiMessage> generate(List<ChatMessage> messages,
+                                         List<ToolSpecification> toolSpecifications,
+                                         ToolSpecification toolThatMustBeExecuted
+    ) {
+        ChatCompletionsOptions options = new ChatCompletionsOptions(toAzureAiMessages(messages))
+                .setModel(modelName)
+                .setMaxTokens(maxTokens)
+                .setTemperature(temperature)
+                .setTopP(topP)
+                .setStop(stop)
+                .setPresencePenalty(presencePenalty)
+                .setFrequencyPenalty(frequencyPenalty)
+                .setSeed(seed)
+                .setResponseFormat(responseFormat);
+
+        if (toolThatMustBeExecuted != null) {
+            options.setTools(toToolDefinitions(singletonList(toolThatMustBeExecuted)));
+            options.setToolChoice(toToolChoice(toolThatMustBeExecuted));
+        }
+        if (!isNullOrEmpty(toolSpecifications)) {
+            options.setTools(toToolDefinitions(toolSpecifications));
+        }
+
+        ChatModelRequest modelListenerRequest = createModelListenerRequest(options, messages, toolSpecifications);
+        Map<Object, Object> attributes = new ConcurrentHashMap<>();
+        ChatModelRequestContext requestContext = new ChatModelRequestContext(modelListenerRequest, attributes);
+        listeners.forEach(listener -> {
+            try {
+                listener.onRequest(requestContext);
+            } catch (Exception e) {
+                logger.warn("Exception while calling model listener", e);
+            }
+        });
+
+        try {
+            ChatCompletions chatCompletions = client.complete(options);
+            Response<AiMessage> response = Response.from(
+                    aiMessageFrom(chatCompletions.getChoices().get(0).getMessage()),
+                    tokenUsageFrom(chatCompletions.getUsage()),
+                    finishReasonFrom(chatCompletions.getChoices().get(0).getFinishReason())
+            );
+
+            ChatModelResponse modelListenerResponse = createModelListenerResponse(
+                    chatCompletions.getId(),
+                    options.getModel(),
+                    response
+            );
+            ChatModelResponseContext responseContext = new ChatModelResponseContext(
+                    modelListenerResponse,
+                    modelListenerRequest,
+                    attributes
+            );
+            listeners.forEach(listener -> {
+                try {
+                    listener.onResponse(responseContext);
+                } catch (Exception e) {
+                    logger.warn("Exception while calling model listener", e);
+                }
+            });
+
+            return response;
+        } catch (HttpResponseException httpResponseException) {
+            logger.info("Error generating response, {}", httpResponseException.getValue());
+            FinishReason exceptionFinishReason = contentFilterManagement(httpResponseException, "content_filter");
+            Response<AiMessage> response = Response.from(
+                    aiMessage(httpResponseException.getMessage()),
+                    null,
+                    exceptionFinishReason
+            );
+            ChatModelErrorContext errorContext = new ChatModelErrorContext(
+                    httpResponseException,
+                    modelListenerRequest,
+                    null,
+                    attributes
+            );
+
+            listeners.forEach(listener -> {
+                try {
+                    listener.onError(errorContext);
+                } catch (Exception e2) {
+                    logger.warn("Exception while calling model listener", e2);
+                }
+            });
+            return response;
+        }
+    }
+
+    public static Builder builder() {
         for (GitHubModelsChatModelBuilderFactory factory : loadFactories(GitHubModelsChatModelBuilderFactory.class)) {
             return factory.get();
         }
-        return new GitHubModelsChatModel.Builder();
+        return new Builder();
     }
 
     public static class Builder {
 
-        private String apiKey;
-        private String deploymentName;
-        private Tokenizer tokenizer;
+        private String endpoint;
+        private String serviceVersion;
+        private String gitHubToken;
+        private String modelName;
         private Integer maxTokens;
         private Double temperature;
         private Double topP;
-        private Map<String, Integer> logitBias;
-        private String user;
-        private Integer n;
         private List<String> stop;
         private Double presencePenalty;
         private Double frequencyPenalty;
-        List<AzureChatExtensionConfiguration> dataSources;
-        AzureChatEnhancementConfiguration enhancements;
         Long seed;
         ChatCompletionsResponseFormat responseFormat;
         private Duration timeout;
         private Integer maxRetries;
         private ProxyOptions proxyOptions;
         private boolean logRequestsAndResponses;
-        private OpenAIClient openAIClient;
+        private ChatCompletionsClient chatCompletionsClient;
         private String userAgentSuffix;
         private List<ChatModelListener> listeners;
+        private Map<String, String> customHeaders;
 
         /**
-         * Sets the GitHub Models API key.
+         * Sets the GitHub Models endpoint. The default endpoint will be used if this isn't set.
          *
-         * @param apiKey The GitHub Models API key.
+         * @param endpoint The GitHub Models endpoint in the format: https://models.inference.ai.azure.com
          * @return builder
          */
-        public Builder apiKey(String apiKey) {
-            this.apiKey = apiKey;
+        public Builder endpoint(String endpoint) {
+            this.endpoint = endpoint;
             return this;
         }
 
         /**
-         * Sets the deployment name in GitHub Models. This is a mandatory parameter.
-         * <p>
-         * GitHub Models can be found in the marketplace at "https://github.com/marketplace/models".
+         * Sets the Azure OpenAI API service version. This is a mandatory parameter.
          *
-         * @param deploymentName The Deployment name.
+         * @param serviceVersion The Azure OpenAI API service version in the format: 2023-05-15
          * @return builder
          */
-        public Builder deploymentName(String deploymentName) {
-            this.deploymentName = deploymentName;
+        public Builder serviceVersion(String serviceVersion) {
+            this.serviceVersion = serviceVersion;
             return this;
         }
 
-        public Builder tokenizer(Tokenizer tokenizer) {
-            this.tokenizer = tokenizer;
+        /**
+         * Sets the GitHub token to access GitHub Models.
+         *
+         * @param gitHubToken The GitHub token.
+         * @return builder
+         */
+        public Builder gitHubToken(String gitHubToken) {
+            this.gitHubToken = gitHubToken;
+            return this;
+        }
+
+        /**
+         * Sets the deployment name in Azure AI Inference API. This is a mandatory parameter.
+         *
+         * @param modelName The Model name.
+         * @return builder
+         */
+        public Builder modelName(String modelName) {
+            this.modelName = modelName;
             return this;
         }
 
@@ -136,21 +301,6 @@ public class GitHubModelsChatModel extends AzureOpenAiChatModel {
             return this;
         }
 
-        public Builder logitBias(Map<String, Integer> logitBias) {
-            this.logitBias = logitBias;
-            return this;
-        }
-
-        public Builder user(String user) {
-            this.user = user;
-            return this;
-        }
-
-        public Builder n(Integer n) {
-            this.n = n;
-            return this;
-        }
-
         public Builder stop(List<String> stop) {
             this.stop = stop;
             return this;
@@ -163,16 +313,6 @@ public class GitHubModelsChatModel extends AzureOpenAiChatModel {
 
         public Builder frequencyPenalty(Double frequencyPenalty) {
             this.frequencyPenalty = frequencyPenalty;
-            return this;
-        }
-
-        public Builder dataSources(List<AzureChatExtensionConfiguration> dataSources) {
-            this.dataSources = dataSources;
-            return this;
-        }
-
-        public Builder enhancements(AzureChatEnhancementConfiguration enhancements) {
-            this.enhancements = enhancements;
             return this;
         }
 
@@ -212,13 +352,13 @@ public class GitHubModelsChatModel extends AzureOpenAiChatModel {
         }
 
         /**
-         * Sets the Azure OpenAI client. This is an optional parameter, if you need more flexibility than using the endpoint, serviceVersion, apiKey, deploymentName parameters.
+         * Sets the Azure AI Inference API client. This is an optional parameter, if you need more flexibility than the common parameters.
          *
-         * @param openAIClient The Azure OpenAI client.
+         * @param chatCompletionsClient The Azure AI Inference API client.
          * @return builder
          */
-        public Builder openAIClient(OpenAIClient openAIClient) {
-            this.openAIClient = openAIClient;
+        public Builder chatCompletionsClient(ChatCompletionsClient chatCompletionsClient) {
+            this.chatCompletionsClient = chatCompletionsClient;
             return this;
         }
 
@@ -227,22 +367,24 @@ public class GitHubModelsChatModel extends AzureOpenAiChatModel {
             return this;
         }
 
+        public Builder customHeaders(Map<String, String> customHeaders) {
+            this.customHeaders = customHeaders;
+            return this;
+        }
+
         public GitHubModelsChatModel build() {
-            return new GitHubModelsChatModel(
-                        apiKey,
-                        deploymentName,
-                        tokenizer,
+            if (chatCompletionsClient == null) {
+                return new GitHubModelsChatModel(
+                        endpoint,
+                        serviceVersion,
+                        gitHubToken,
+                        modelName,
                         maxTokens,
                         temperature,
                         topP,
-                        logitBias,
-                        user,
-                        n,
                         stop,
                         presencePenalty,
                         frequencyPenalty,
-                        dataSources,
-                        enhancements,
                         seed,
                         responseFormat,
                         timeout,
@@ -250,8 +392,25 @@ public class GitHubModelsChatModel extends AzureOpenAiChatModel {
                         proxyOptions,
                         logRequestsAndResponses,
                         listeners,
-                        userAgentSuffix
+                        userAgentSuffix,
+                        customHeaders
                 );
+
+            } else {
+                return new GitHubModelsChatModel(
+                        chatCompletionsClient,
+                        modelName,
+                        maxTokens,
+                        temperature,
+                        topP,
+                        stop,
+                        presencePenalty,
+                        frequencyPenalty,
+                        seed,
+                        responseFormat,
+                        listeners
+                );
+            }
         }
     }
 }
